@@ -1,0 +1,35 @@
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
+
+class AndroidActionType(str, Enum):
+    """Enumeration of possible Android actions."""
+    TAP = "tap"
+    TYPE = "type"
+    PRESS = "press"
+    SWIPE = "swipe"
+    SCREENSHOT = "screenshot"
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+@dataclass
+class Coordinate:
+    """Represents a coordinate point on the screen."""
+    x: int
+    y: int
+
+@dataclass
+class SwipeCoordinates:
+    """Represents start and end coordinates for swipe actions."""
+    start: Coordinate
+    end: Coordinate
+    duration: int = 100  # Default duration in milliseconds
+
+@dataclass
+class AndroidAction:
+    """Represents an action to perform on an Android device."""
+    action: AndroidActionType
+    coordinate: Optional[Coordinate] = None
+    text: Optional[str] = None
+    key: Optional[int] = None
+    swipe: Optional[SwipeCoordinates] = None 
