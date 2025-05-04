@@ -15,16 +15,9 @@ from typing import List
 # Add the parent directory to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from android_agent import (
-    AndroidAgent,
-    AndroidAgentOptions,
-    AndroidAction,
-    AndroidActionType,
-    OpenAIPlanner,
-    OpenAIPlannerOptions,
-    AndroidGoalState
-)
-
+from android_agent.android_agent import AndroidAgent, AndroidAgentOptions
+from android_agent.android_action import AndroidAction, AndroidActionType
+from android_agent.openai_planner import OpenAIPlanner, OpenAIPlannerOptions
 
 def main():
     """Main function to run the Google search automation."""
@@ -41,7 +34,7 @@ def main():
         api_key=args.api_key,
         model="gpt-4o",
         temperature=0.2,
-        debug=False
+        debug=True  # Enable debug mode to see full responses
     )
     planner = OpenAIPlanner(options=planner_options)
 
@@ -59,7 +52,7 @@ def main():
             "If you end up in Google Lens or other Google apps, press back and try again",
             "Verify you're in Chrome by looking for the address bar",
             "If stuck, try pressing home and starting over",
-            "After tapping the search bar, wait for the keyboard to appear before typing",
+            "After tapping the search bar, wait for keyboard to appear before typing",
             "If the keyboard doesn't appear after tapping, try tapping a different part of the search bar",
             "After typing, look for and tap the 'Search' or 'Go' button on the keyboard",
             "If you see the same screen after an action, try a different approach",
@@ -108,6 +101,7 @@ def main():
         agent.start()
         
         # Check final status
+        from android_agent.android_agent import AndroidGoalState
         if agent.status == AndroidGoalState.SUCCESS:
             print("Successfully completed Google search!")
         else:

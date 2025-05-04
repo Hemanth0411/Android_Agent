@@ -8,7 +8,10 @@ class AndroidActionType(str, Enum):
     TYPE = "type"
     PRESS = "press"
     SWIPE = "swipe"
+    SWIPE_UP = "swipe_up"
+    SWIPE_DOWN = "swipe_down"
     SCREENSHOT = "screenshot"
+    LAUNCH_APP = "launch_app"
     SUCCESS = "success"
     FAILURE = "failure"
 

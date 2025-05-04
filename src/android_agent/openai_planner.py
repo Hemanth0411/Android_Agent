@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 from openai import OpenAI
 
 from .base_planner import ActionPlanner
-from .android_action import AndroidAction, AndroidActionType, Coordinate
+from .android_action import AndroidAction, AndroidActionType, Coordinate, SwipeCoordinates
 from .android_state import AndroidState
 from .android_step import AndroidStep
 
@@ -124,7 +124,7 @@ Your response must be formatted as follows:
 
 ```action
 {
-  "action_type": "[TAP, SWIPE, SWIPE_UP, SWIPE_DOWN, TYPE, BACK, HOME, LAUNCH_APP, SUCCESS, FAILURE]",
+  "action": "[TAP, SWIPE, SWIPE_UP, SWIPE_DOWN, TYPE, BACK, HOME, LAUNCH_APP, SUCCESS, FAILURE]",
   "x": 0.5,  // For TAP or SWIPE start (normalized 0-1, omit if not needed)
   "y": 0.5,  // For TAP or SWIPE start (normalized 0-1, omit if not needed)
   "end_x": 0.5,  // For SWIPE end (normalized 0-1, omit if not needed)
@@ -172,13 +172,13 @@ Your response must be formatted as follows:
             for i, step in enumerate(history[-5:]):  # Only include last 5 steps
                 action = step.action
                 state = step.state
-                action_desc = f"{i+1}. {action.action_type}"
+                action_desc = f"{i+1}. {action.action}"
                 
-                if action.action_type == AndroidActionType.TAP and action.coordinates:
-                    action_desc += f" at ({action.coordinates.x:.2f}, {action.coordinates.y:.2f})"
-                elif action.action_type == AndroidActionType.SWIPE and action.coordinates and action.end_coordinates:
-                    action_desc += f" from ({action.coordinates.x:.2f}, {action.coordinates.y:.2f}) to ({action.end_coordinates.x:.2f}, {action.end_coordinates.y:.2f})"
-                elif action.action_type in (AndroidActionType.TYPE, AndroidActionType.LAUNCH_APP) and action.text:
+                if action.action == AndroidActionType.TAP and action.coordinate:
+                    action_desc += f" at ({action.coordinate.x:.2f}, {action.coordinate.y:.2f})"
+                elif action.action == AndroidActionType.SWIPE and action.swipe:
+                    action_desc += f" from ({action.swipe.start.x:.2f}, {action.swipe.start.y:.2f}) to ({action.swipe.end.x:.2f}, {action.swipe.end.y:.2f})"
+                elif action.action in (AndroidActionType.TYPE, AndroidActionType.LAUNCH_APP) and action.text:
                     action_desc += f" with text: '{action.text}'"
                 
                 # Add state information to show the outcome
@@ -204,17 +204,40 @@ Your response must be formatted as follows:
         """
         try:
             # Extract JSON from response
-            json_match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
+            json_match = re.search(r'```(?:json|action)\n(.*?)\n```', response_text, re.DOTALL)
             if not json_match:
-                print("No JSON found in response, trying to infer action from text")
+                print("⚠️ No JSON found in response, trying to infer action from text")
+                # Print first 200 chars of the response for debugging
+                print(f"📝 Response excerpt: {response_text[:200]}...")
                 return self._infer_action_from_text(response_text)
             
-            action_json = json.loads(json_match.group(1))
+            json_text = json_match.group(1)
+            print(f"✅ Found JSON: {json_text}")
+            
+            try:
+                action_json = json.loads(json_text)
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON parse error: {e}")
+                print(f"📝 JSON text: {json_text}")
+                return self._infer_action_from_text(response_text)
+            
+            # Check if action key exists
+            if "action" not in action_json:
+                if "action_type" in action_json:
+                    print("⚠️ Found 'action_type' instead of 'action' - converting")
+                    action_json["action"] = action_json["action_type"]
+                else:
+                    print(f"❌ Missing 'action' field in JSON: {action_json}")
+                    return self._infer_action_from_text(response_text)
             
             # Create appropriate action based on type
             action_type = action_json.get("action", "").lower()
             
             if action_type == "tap":
+                if "x" not in action_json or "y" not in action_json:
+                    print(f"❌ Missing coordinates for tap: {action_json}")
+                    return self._infer_action_from_text(response_text)
+                
                 return AndroidAction(
                     action=AndroidActionType.TAP,
                     coordinate=Coordinate(
@@ -223,17 +246,29 @@ Your response must be formatted as follows:
                     )
                 )
             elif action_type == "type":
+                if "text" not in action_json:
+                    print(f"❌ Missing text for typing: {action_json}")
+                    return self._infer_action_from_text(response_text)
+                
                 return AndroidAction(
                     action=AndroidActionType.TYPE,
                     text=action_json["text"]
                 )
             elif action_type == "press":
+                if "key" not in action_json:
+                    print(f"❌ Missing key for press: {action_json}")
+                    return self._infer_action_from_text(response_text)
+                
                 key = 4 if action_json["key"] == "back" else 3  # 4 is back, 3 is home
                 return AndroidAction(
                     action=AndroidActionType.PRESS,
                     key=key
                 )
             elif action_type == "swipe":
+                if "start_x" not in action_json or "start_y" not in action_json or "end_x" not in action_json or "end_y" not in action_json:
+                    print(f"❌ Missing coordinates for swipe: {action_json}")
+                    return self._infer_action_from_text(response_text)
+                
                 return AndroidAction(
                     action=AndroidActionType.SWIPE,
                     swipe=SwipeCoordinates(
@@ -252,12 +287,19 @@ Your response must be formatted as follows:
                 return AndroidAction(action=AndroidActionType.SUCCESS)
             elif action_type == "failure":
                 return AndroidAction(action=AndroidActionType.FAILURE)
+            elif action_type in ("home", "back"):
+                # Handle these directly
+                key = 3 if action_type == "home" else 4
+                return AndroidAction(action=AndroidActionType.PRESS, key=key)
             else:
-                print(f"Unknown action type: {action_type}")
+                print(f"⚠️ Unknown action type: {action_type}")
                 return self._infer_action_from_text(response_text)
                 
         except Exception as e:
-            print(f"Error parsing action response: {e}")
+            print(f"❌ Error parsing action response: {e}")
+            # Print traceback for debugging
+            import traceback
+            traceback.print_exc()
             return self._infer_action_from_text(response_text)
     
     def _infer_action_from_text(self, text: str) -> AndroidAction:
@@ -269,14 +311,48 @@ Your response must be formatted as follows:
         Returns:
             Inferred AndroidAction
         """
+        print("🔍 Inferring action from text")
         text = text.lower()
+        
+        # Common actions based on simple text
+        action_map = {
+            "go home": (AndroidActionType.PRESS, 3),
+            "press home": (AndroidActionType.PRESS, 3),
+            "go back": (AndroidActionType.PRESS, 4),
+            "press back": (AndroidActionType.PRESS, 4), 
+            "task completed": (AndroidActionType.SUCCESS, None),
+            "goal achieved": (AndroidActionType.SUCCESS, None),
+            "cannot complete": (AndroidActionType.FAILURE, None),
+            "unable to proceed": (AndroidActionType.FAILURE, None),
+        }
+        
+        # Check for exact phrases first
+        for phrase, (action_type, value) in action_map.items():
+            if phrase in text:
+                print(f"✅ Matched phrase: '{phrase}' -> {action_type}")
+                if action_type == AndroidActionType.PRESS:
+                    return AndroidAction(action=action_type, key=value)
+                else:
+                    return AndroidAction(action=action_type)
         
         # Look for success or failure indications
         if "success" in text or "goal achieved" in text or "task complete" in text:
+            print("✅ Success detected in text")
             return AndroidAction(action=AndroidActionType.SUCCESS)
         
         if "fail" in text or "cannot" in text or "unable" in text:
+            print("❌ Failure detected in text")
             return AndroidAction(action=AndroidActionType.FAILURE)
+        
+        # Check for home command first (high priority)
+        if re.search(r'\bhome\b', text):
+            print("🏠 Home command detected")
+            return AndroidAction(action=AndroidActionType.PRESS, key=3)  # 3 is home
+            
+        # Check for back command first (high priority)
+        if re.search(r'\bback\b', text):
+            print("⬅️ Back command detected")
+            return AndroidAction(action=AndroidActionType.PRESS, key=4)  # 4 is back
         
         # Look for tap indications
         tap_match = re.search(r'(?:tap|click).*?(\d+\.?\d*).*?(\d+\.?\d*)', text)
@@ -284,12 +360,13 @@ Your response must be formatted as follows:
             try:
                 x = float(tap_match.group(1))
                 y = float(tap_match.group(2))
+                print(f"👆 Tap detected at coordinates ({x}, {y})")
                 return AndroidAction(
                     action=AndroidActionType.TAP,
                     coordinate=Coordinate(x=int(x * 1000), y=int(y * 1000))
                 )
-            except (ValueError, IndexError):
-                pass
+            except (ValueError, IndexError) as e:
+                print(f"❌ Error parsing tap coordinates: {e}")
         
         # Look for swipe indications
         swipe_match = re.search(r'swipe.*?from.*?(\d+\.?\d*).*?(\d+\.?\d*).*?to.*?(\d+\.?\d*).*?(\d+\.?\d*)', text)
@@ -299,6 +376,7 @@ Your response must be formatted as follows:
                 start_y = float(swipe_match.group(2))
                 end_x = float(swipe_match.group(3))
                 end_y = float(swipe_match.group(4))
+                print(f"👆 Swipe detected from ({start_x}, {start_y}) to ({end_x}, {end_y})")
                 return AndroidAction(
                     action=AndroidActionType.SWIPE,
                     swipe=SwipeCoordinates(
@@ -307,42 +385,41 @@ Your response must be formatted as follows:
                         duration=100
                     )
                 )
-            except (ValueError, IndexError):
-                pass
+            except (ValueError, IndexError) as e:
+                print(f"❌ Error parsing swipe coordinates: {e}")
         
         # Look for swipe up/down
         if "swipe up" in text:
-            return AndroidAction(action_type=AndroidActionType.SWIPE_UP, id=str(uuid.uuid4()))
+            print("👆 Swipe up detected")
+            return AndroidAction(action=AndroidActionType.SWIPE_UP)
         
         if "swipe down" in text:
-            return AndroidAction(action_type=AndroidActionType.SWIPE_DOWN, id=str(uuid.uuid4()))
+            print("👇 Swipe down detected")
+            return AndroidAction(action=AndroidActionType.SWIPE_DOWN)
         
         # Look for typing
         type_match = re.search(r'type.*[\'"](.+?)[\'"]', text)
         if type_match:
+            text_content = type_match.group(1)
+            print(f"⌨️ Type detected: '{text_content}'")
             return AndroidAction(
                 action=AndroidActionType.TYPE,
-                text=type_match.group(1)
+                text=text_content
             )
         
         # Look for launch app
         launch_match = re.search(r'launch.*?[\'"](.+?)[\'"]', text)
         if launch_match:
+            app_name = launch_match.group(1)
+            print(f"🚀 Launch app detected: '{app_name}'")
             return AndroidAction(
-                action_type=AndroidActionType.LAUNCH_APP,
-                text=launch_match.group(1),
-                id=str(uuid.uuid4())
+                action=AndroidActionType.LAUNCH_APP,
+                text=app_name
             )
         
-        # Look for press actions
-        if "back" in text:
-            return AndroidAction(action=AndroidActionType.PRESS, key=4)
-        
-        if "home" in text:
-            return AndroidAction(action=AndroidActionType.PRESS, key=3)
-        
-        # Default to failure if we can't determine an action
-        return AndroidAction(action=AndroidActionType.FAILURE)
+        # Default to pressing home if we can't determine an action
+        print("⚠️ Couldn't determine action from text, defaulting to home")
+        return AndroidAction(action=AndroidActionType.PRESS, key=3)
     
     def plan_action(
         self,
@@ -352,76 +429,106 @@ Your response must be formatted as follows:
         current_state: Optional[AndroidState] = None,
         session_history: Optional[List[AndroidStep]] = None
     ) -> AndroidAction:
-        """Plan next action using OpenAI's API."""
-        # Format system prompt with improved instructions
-        system_prompt = self.format_system_prompt(goal, additional_context or "", additional_instructions or [])
+        """Plan next action based on current state and goal.
         
-        # Add history analysis to prevent repetitive actions
-        if session_history and len(session_history) > 0:
-            # Check for repeated actions
-            recent_actions = [step.action.action_type for step in session_history[-3:]]
-            if len(recent_actions) >= 3 and all(a == recent_actions[0] for a in recent_actions):
-                system_prompt += "\nWARNING: The last few actions were all the same type. Try a different approach."
+        Args:
+            goal: The goal to achieve
+            additional_context: Extra context information
+            additional_instructions: Extra instructions
+            current_state: Current device state
+            session_history: History of previous actions and states
             
-            # Check for repeated states
-            recent_states = [step.state.current_app for step in session_history[-3:]]
-            if len(recent_states) >= 3 and all(s == recent_states[0] for s in recent_states):
-                system_prompt += "\nWARNING: The device state hasn't changed in the last few actions. Try a different approach."
-            
-            # Add action statistics
-            action_counts = {}
-            for step in session_history:
-                action_type = step.action.action_type
-                action_counts[action_type] = action_counts.get(action_type, 0) + 1
-            
-            system_prompt += "\nAction statistics:"
-            for action_type, count in action_counts.items():
-                if count > 0:
-                    system_prompt += f"\n- {action_type}: {count} times"
-            
-            # Add guidance based on history
-            system_prompt += "\n\nBased on the history, try to:"
-            system_prompt += "\n1. Avoid repeating the same action type too many times"
-            system_prompt += "\n2. Try different approaches if the current one isn't working"
-            system_prompt += "\n3. Consider the outcomes of previous actions when planning the next step"
+        Returns:
+            The next action to perform
+        """
+        if not current_state:
+            print("❌ No current state provided")
+            return AndroidAction(action=AndroidActionType.FAILURE)
         
-        # Format message content
-        message_content = self.format_message_content(
-            current_state or AndroidState(screenshot="", width=0, height=0, current_app=""), 
-            include_history=bool(session_history),
-            history=session_history
-        )
-        
-        if self.options.debug:
-            print(f"System prompt: {system_prompt}")
-            print(f"Message content: {message_content}")
-        
-        # Make API call
         try:
+            # Prepare conversation context
+            system_prompt = self.format_system_prompt(
+                goal,
+                additional_context or "",
+                additional_instructions or []
+            )
+            print(f"🔵 System prompt length: {len(system_prompt)} characters")
+            
+            # Prepare message content including screenshot
+            content = self.format_message_content(
+                current_state,
+                include_history=True,
+                history=session_history
+            )
+            print(f"🔵 Screenshot base64 size: {len(current_state.screenshot)/1024:.1f} KB")
+            
+            # Prepare messages for API call
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content}
+            ]
+            
+            # Make API call
+            print(f"🤖 Calling OpenAI API for action plan...")
             response = self.client.chat.completions.create(
                 model=self.options.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": message_content}
-                ],
+                messages=messages,
                 temperature=self.options.temperature,
                 max_tokens=self.options.max_tokens
             )
             
-            # Get response text
+            # Extract response text
             response_text = response.choices[0].message.content
             
-            if self.options.debug:
-                print(f"Response: {response_text}")
+            # Store the observation section for UI detection
+            observation = self._extract_section(response_text, "observation")
+            if observation:
+                self.last_observation = observation
+                print(f"👁️ OBSERVATION: {observation}")
+            else:
+                self.last_observation = ""
             
-            # Parse action
+            # Extract reasoning for debugging
+            reasoning = self._extract_section(response_text, "reasoning")
+            if reasoning:
+                print(f"🧠 REASONING: {reasoning}")
+            
+            # Parse response to get action
             action = self.parse_action_response(response_text)
             
+            # Log full response for debugging
             if self.options.debug:
-                print(f"Parsed action: {action}")
+                print(f"📝 Full response: {response_text}")
+            else:
+                print(f"🔄 Full response: {response_text}")
             
+            # Log action
+            print(f"🎯 Selected action: {action.action}")
+            
+            # Special case for Chrome UI detection
+            if "chrome" in self.last_observation.lower() and ("com.android.chrome" not in current_state.current_app):
+                print("⚠️ Chrome UI detected but not in app name. This may indicate incorrect app detection.")
+                
             return action
             
         except Exception as e:
-            print(f"Error during OpenAI API call: {e}")
-            return AndroidAction(action_type=AndroidActionType.FAILURE) 
+            print(f"❌ Error in plan_action: {e}")
+            import traceback
+            traceback.print_exc()
+            return AndroidAction(action=AndroidActionType.FAILURE)
+            
+    def _extract_section(self, text: str, section_name: str) -> Optional[str]:
+        """Extract a specific section from the response.
+        
+        Args:
+            text: The full response text
+            section_name: The name of the section to extract
+            
+        Returns:
+            The extracted section text or None if not found
+        """
+        pattern = rf"```{section_name}\n(.*?)```"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return None 
