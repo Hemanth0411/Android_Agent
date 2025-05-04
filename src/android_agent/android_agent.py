@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import time
+import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -24,7 +25,12 @@ from .android_controller import (
     press_back,
     press_home,
     launch_app,
-    get_current_app
+    get_current_app,
+    wait_for_keyboard,
+    is_keyboard_visible,
+    dismiss_keyboard,
+    smart_type_text,
+    type_text_with_uiautomator2
 )
 from .android_action import AndroidAction, AndroidActionType, Coordinate, SwipeCoordinates
 from .state_tracker import AndroidStateTracker
@@ -111,153 +117,176 @@ class AndroidAgent:
         self.device = None
     
     def _take_action(self, action: AndroidAction) -> bool:
-        """Execute an action with state tracking and validation.
+        """Execute an action on the device.
         
         Args:
-            action: The action to execute
+            action: Action to execute
             
         Returns:
-            bool: Whether the action was successful
+            bool: Whether the action executed successfully
         """
-        print(f"DEBUG: Next action: {action.action}, coordinate: {getattr(action, 'coordinate', None)}, text: {getattr(action, 'text', None)}")
+        if not action.action:
+            print("❌ Error: No action specified")
+            return False
+            
+        action_type = action.action
         
         try:
-            if action.action == AndroidActionType.SCREENSHOT:
-                return True
+            # Print action details
+            print(f"\n▶️ Taking action: {action_type}")
+            if action.coordinate:
+                print(f"📍 Coordinate: {action.coordinate}")
+            if action.text:
+                print(f"💬 Text: {action.text}")
+            if action.key is not None:
+                print(f"🔑 Key: {action.key}")
                 
-            elif action.action == AndroidActionType.TAP:
+            # Record the action in our counter
+            if action_type not in self.action_counts:
+                self.action_counts[action_type] = 0
+            self.action_counts[action_type] += 1
+            
+            # Handle different action types
+            if action_type == AndroidActionType.TAP:
                 if not action.coordinate:
-                    print("❌ Error: Coordinate is required for tap action")
+                    print("❌ Error: No coordinate specified for tap action")
                     return False
-                    
-                # Check if we're tapping near the bottom of the screen (likely app icon)
-                is_app_icon = False
-                # Check bottom 15% of screen for app icons
-                if action.coordinate.y > 0.85:
-                    print("🔍 Tap detected at bottom of screen - likely app icon/navigation")
-                    is_app_icon = True
-                    
-                if not self.state_tracker.update_state(action.action, coordinate=(action.coordinate.x, action.coordinate.y)):
-                    print("⚠️ Redundant tap detected. Skipping...")
-                    return False
-                    
-                # Execute tap and get success/failure
-                tap_success = tap(self.adb_path, action.coordinate.x, action.coordinate.y)
+                x, y = action.coordinate.x, action.coordinate.y
                 
-                # If tap failed, report back
-                if not tap_success:
-                    print("❌ Tap action failed")
-                    return False
+                # Check if this is a tap on an input field and note the coordinates
+                # for possible UIAutomator2 typing fallback
+                if self.state_tracker._is_input_box(action.coordinate):
+                    self.last_input_tap_coords = action.coordinate
+                    print(f"📝 Noted input field tap at {action.coordinate} for potential fallback typing")
                 
-                # For app icons, wait a bit longer for app to launch
-                if is_app_icon:
-                    print("⏳ Waiting for app to launch...")
-                    time.sleep(1.5)  # Extra wait time for app launch
+                tap(self.adb_path, x, y)
                 
-                # If we tapped an input box, note for next action
-                if self.state_tracker.input_box_tapped:
-                    print("🖋️ Input box tapped - next action should be typing")
+                # Wait a bit after tapping to allow keyboard to appear
+                time.sleep(0.5)
                 
-                return True
-                
-            elif action.action == AndroidActionType.TYPE:
-                if not action.text:
-                    print("❌ Error: Text is required for type action")
-                    return False
-                    
-                if not self.state_tracker.update_state(action.action, text=action.text):
-                    print("⚠️ Type action not allowed: must tap input field first")
-                    return False
-                    
+                # Update keyboard visibility status
                 try:
-                    type_text(self.adb_path, action.text)
-                    print(f"⌨️ Typed text: '{action.text}'")
-                    return True
+                    keyboard_visible = is_keyboard_visible(self.adb_path)
+                    self.state_tracker.set_keyboard_visible(keyboard_visible)
+                    if keyboard_visible:
+                        print("⌨️ Keyboard appeared after tap")
                 except Exception as e:
-                    print(f"❌ Error typing text: {e}")
+                    print(f"⚠️ Failed to check keyboard state: {e}")
+                
+            elif action_type == AndroidActionType.TYPE:
+                if not action.text:
+                    print("❌ Error: No text specified for type action")
                     return False
-                    
-            elif action.action == AndroidActionType.PRESS:
-                if not action.key:
-                    print("❌ Error: Key is required for press action")
+                
+                # Use smart text input method that includes UIAutomator2 fallback
+                # if keyboard is not visible
+                if hasattr(self, 'last_input_tap_coords') and self.last_input_tap_coords:
+                    x, y = self.last_input_tap_coords.x, self.last_input_tap_coords.y
+                    print(f"📝 Using last input field tap at {self.last_input_tap_coords} for smart typing")
+                    smart_type_text(self.adb_path, action.text, x, y)
+                else:
+                    # No coordinates available, try without them
+                    smart_type_text(self.adb_path, action.text)
+                
+            elif action_type == AndroidActionType.SWIPE_UP:
+                swipe_up(self.adb_path, distance=0.5)
+            elif action_type == AndroidActionType.SWIPE_DOWN:
+                swipe_down(self.adb_path, distance=0.5)
+            elif action_type == AndroidActionType.SWIPE:
+                if not action.start_coordinate or not action.end_coordinate:
+                    print("❌ Error: Start and end coordinates required for swipe action")
                     return False
-                    
-                if not self.state_tracker.update_state(action.action):
-                    print("⚠️ Redundant press detected. Skipping...")
+                start_x, start_y = action.start_coordinate.x, action.start_coordinate.y
+                end_x, end_y = action.end_coordinate.x, action.end_coordinate.y
+                swipe(self.adb_path, start_x, start_y, end_x, end_y)
+            elif action_type == AndroidActionType.PRESS:
+                if action.key is None:
+                    print("❌ Error: No key specified for press action")
                     return False
+                key = action.key
+                if key == 4:  # Back button
+                    press_back(self.adb_path)
+                elif key == 3:  # Home button
+                    press_home(self.adb_path)
+                else:
+                    command = f"{self.adb_path} shell input keyevent {key}"
+                    subprocess.run(command, shell=True, check=True)
+            elif action_type == AndroidActionType.WAIT:
+                duration = action.duration if action.duration else 2
+                print(f"⏱️ Waiting for {duration} seconds...")
+                time.sleep(duration)
+            elif action_type == AndroidActionType.LAUNCH_APP:
+                if not action.package:
+                    print("❌ Error: No package specified for launch_app action")
+                    return False
+                print(f"🚀 Launching app: {action.package}")
+                
+                # Special handling for Chrome as it's commonly problematic
+                if "chrome" in action.package.lower():
+                    print("🌐 Using Chrome-specific launch strategies")
                     
-                try:
-                    if action.key == 4:
-                        press_back(self.adb_path)
-                        print("⬅️ Pressed BACK button")
+                    # Try different Chrome launch approaches
+                    
+                    # 1. First try standard launch
+                    standard_launch = launch_app(self.adb_path, action.package, action.activity)
+                    
+                    # 2. If standard launch doesn't work, try alternative methods
+                    if not standard_launch:
+                        # Try multiple known Chrome package names
+                        chrome_packages = [
+                            "com.android.chrome",
+                            "com.chrome.beta",
+                            "com.google.android.apps.chrome",
+                            "org.chromium.chrome"
+                        ]
+                        
+                        for pkg in chrome_packages:
+                            if pkg != action.package:
+                                print(f"🌐 Trying alternative Chrome package: {pkg}")
+                                alt_launch = launch_app(self.adb_path, pkg)
+                                if alt_launch:
+                                    print(f"✅ Successfully launched Chrome with alternative package: {pkg}")
+                                    time.sleep(2)  # Wait for Chrome to fully load
+                                    return True
+                        
+                        # If all package attempts fail, try using monkey
+                        print("🌐 Trying monkey command for Chrome launch...")
+                        monkey_cmd = f"{self.adb_path} shell monkey -p {action.package} -c android.intent.category.LAUNCHER 1"
+                        try:
+                            result = subprocess.run(monkey_cmd, shell=True, check=False, capture_output=True, text=True)
+                            if "Events injected: 1" in result.stdout:
+                                print("✅ Chrome launched via monkey command")
+                                time.sleep(2)  # Wait for Chrome to fully load
+                                return True
+                        except Exception as e:
+                            print(f"⚠️ Monkey launch failed: {e}")
+                    
+                    # Check if launch was successful by verifying current app
+                    time.sleep(2)  # Give app time to launch
+                    current_app = get_current_app(self.adb_path)
+                    if "chrome" in current_app.lower():
+                        print(f"✅ Chrome launch confirmed - current app: {current_app}")
+                        return True
                     else:
-                        press_home(self.adb_path)
-                        print("🏠 Pressed HOME button")
-                    return True
-                except Exception as e:
-                    print(f"❌ Error pressing key: {e}")
-                    return False
-                    
-            elif action.action == AndroidActionType.SWIPE:
-                if not action.swipe:
-                    print("❌ Error: Swipe coordinates are required for swipe action")
-                    return False
-                    
-                if not self.state_tracker.update_state(action.action):
-                    print("⚠️ Redundant swipe detected. Skipping...")
-                    return False
-                    
-                try:
-                    swipe(
-                        self.adb_path,
-                        action.swipe.start.x,
-                        action.swipe.start.y,
-                        action.swipe.end.x,
-                        action.swipe.end.y,
-                        action.swipe.duration
-                    )
-                    print(f"↔️ Swiped from ({action.swipe.start.x}, {action.swipe.start.y}) to ({action.swipe.end.x}, {action.swipe.end.y})")
-                    return True
-                except Exception as e:
-                    print(f"❌ Error during swipe: {e}")
-                    return False
-                    
-            elif action.action == AndroidActionType.SWIPE_UP:
-                try:
-                    swipe_up(self.adb_path)
-                    print("⬆️ Swiped UP")
-                    return True
-                except Exception as e:
-                    print(f"❌ Error swiping up: {e}")
-                    return False
-                    
-            elif action.action == AndroidActionType.SWIPE_DOWN:
-                try:
-                    swipe_down(self.adb_path)
-                    print("⬇️ Swiped DOWN")
-                    return True
-                except Exception as e:
-                    print(f"❌ Error swiping down: {e}")
-                    return False
-                    
-            elif action.action == AndroidActionType.LAUNCH_APP:
-                if not action.text:
-                    print("❌ Error: App package name is required for launch action")
-                    return False
-                    
-                try:
-                    launch_app(self.adb_path, action.text)
-                    print(f"🚀 Launched app: {action.text}")
-                    return True
-                except Exception as e:
-                    print(f"❌ Error launching app: {e}")
-                    return False
+                        print(f"⚠️ Chrome may not have launched - current app: {current_app}")
+                        return False
+                else:
+                    # For non-Chrome apps, use standard launch
+                    return launch_app(self.adb_path, action.package, action.activity)
             else:
-                print(f"⚠️ Unknown action type: {action.action}")
+                print(f"❌ Error: Unknown action type: {action_type}")
                 return False
                 
+            # Pause after action if requested
+            if self.options.pause_after_each_action:
+                input("⏸️ Paused - Press Enter to continue...")
+                
+            return True
+                
         except Exception as e:
-            print(f"❌ Error in _take_action: {e}")
+            print(f"❌ Error executing action: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get_state(self) -> AndroidState:
@@ -486,13 +515,145 @@ class AndroidAgent:
         current_state = self.get_state()
         
         # Check for repeated states
-        if self.detect_repeated_state(current_state):
-            print("❌ Detected repeated state - trying alternative approach")
-            self._status = AndroidGoalState.FAILED
+        repeated_state = self.detect_repeated_state(current_state)
+        
+        # Save a reference to the last action for loop detection
+        last_action_type = None
+        if len(self.history) > 0:
+            last_action_type = self.history[-1].action.action
+            
+        # Initialize action counter for TAP if it doesn't exist
+        if AndroidActionType.TAP not in self.action_counts:
+            self.action_counts[AndroidActionType.TAP] = 0
+            
+        # Check keyboard state to update the state tracker
+        try:
+            keyboard_visible = is_keyboard_visible(self.adb_path)
+            self.state_tracker.set_keyboard_visible(keyboard_visible)
+            print(f"⌨️ Keyboard visible: {keyboard_visible}")
+        except Exception as e:
+            print(f"⚠️ Error checking keyboard state: {e}")
+            
+        # If we've hit repeated state and the last few actions were taps,
+        # try a different strategy to break out of the loop
+        if (repeated_state and last_action_type == AndroidActionType.TAP and 
+            self.action_counts[AndroidActionType.TAP] >= 3):
+            print("🔄 Detected tap loop - trying alternative action to break out")
+            
+            # Special case: If we're trying to tap Chrome repeatedly but it's not launching
+            chrome_target_detected = (
+                "chrome" in str(current_state.current_app).lower() or 
+                self._check_for_chrome_ui(current_state.screenshot) or
+                (len(self.history) > 0 and self.history[-1].action.coordinate and 
+                 self.history[-1].action.coordinate.y > 0.8)  # Bottom of screen tap
+            )
+                
+            if chrome_target_detected:
+                print("🌐 Chrome detected in repeated tap loop - trying direct command")
+                
+                # First try to go home to reset the state
+                press_home(self.adb_path)
+                time.sleep(1)
+                
+                # Try direct Chrome launch with am start (most reliable method)
+                try:
+                    chrome_cmd = f"{self.adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main"
+                    subprocess.run(chrome_cmd, shell=True)
+                    time.sleep(2)
+                    
+                    # Check if Chrome launched
+                    current_app = get_current_app(self.adb_path)
+                    if "chrome" in current_app.lower():
+                        print("✅ Chrome directly launched with am start command")
+                        # Record as a press home + chrome launch action
+                        recovery_action = AndroidAction(
+                            action=AndroidActionType.PRESS,
+                            key=3  # Home key
+                        )
+                        self.history.append(AndroidStep(state=current_state, action=recovery_action))
+                        return
+                except Exception as e:
+                    print(f"⚠️ Chrome direct launch failed: {e}")
+                
+                # Try with monkey command as fallback
+                try:
+                    print("🌐 Trying monkey command to launch Chrome")
+                    monkey_cmd = f"{self.adb_path} shell monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1"
+                    subprocess.run(monkey_cmd, shell=True)
+                    time.sleep(2)
+                    
+                    # Record as a successful recovery
+                    recovery_action = AndroidAction(
+                        action=AndroidActionType.TAP,
+                        coordinate=Coordinate(x=500, y=500),  # Generic coordinate since we used monkey
+                        text="Chrome launch via monkey"
+                    )
+                    self.history.append(AndroidStep(state=current_state, action=recovery_action))
+                    return
+                except Exception as e:
+                    print(f"⚠️ Chrome monkey command failed: {e}")
+            
+            # First check if keyboard is visible
+            try:
+                if is_keyboard_visible(self.adb_path):
+                    print("⌨️ Keyboard is visible but stuck in tap loop - attempting to type")
+                    # Try typing a search term as a recovery action
+                    recovery_action = AndroidAction(
+                        action=AndroidActionType.TYPE,
+                        text="search"
+                    )
+                    self._take_action(recovery_action)
+                    # Record this action
+                    self.history.append(AndroidStep(state=current_state, action=recovery_action))
+                    return
+            except Exception:
+                pass
+                
+            # Check if we have coordinates of a possible input field from previous taps
+            if hasattr(self, 'last_input_tap_coords') and self.last_input_tap_coords:
+                print("🔄 Trying UIAutomator2 direct input as loop-breaking strategy")
+                recovery_text = "search"
+                x, y = self.last_input_tap_coords.x, self.last_input_tap_coords.y
+                
+                try:
+                    # Try using UIAutomator2 to input text directly
+                    if type_text_with_uiautomator2(self.adb_path, recovery_text, x, y):
+                        print("✅ Successfully used UIAutomator2 to break out of loop")
+                        # Record as a type action
+                        recovery_action = AndroidAction(
+                            action=AndroidActionType.TYPE,
+                            text=recovery_text
+                        )
+                        self.history.append(AndroidStep(state=current_state, action=recovery_action))
+                        return
+                except Exception as e:
+                    print(f"⚠️ UIAutomator2 loop-breaking failed: {e}")
+            
+            # Try pressing back as a recovery action
+            print("⬅️ Trying BACK button to break out of loop")
+            recovery_action = AndroidAction(
+                action=AndroidActionType.PRESS,
+                key=4  # Back key
+            )
+            self._take_action(recovery_action)
+            # Record this action
+            self.history.append(AndroidStep(state=current_state, action=recovery_action))
             return
         
         # Get next action from planner
-        print("⏳ Planning next action...")
+        print(f"\n🧠 Determining next action (step {len(self.history) + 1}/{self.options.max_steps})...")
+        
+        # Save screenshot to file if requested
+        if self.options.screenshot_dir:
+            # Create filename with timestamp and step number
+            timestamp = int(time.time())
+            filename = f"{self.options.screenshot_dir}/step_{len(self.history) + 1:02d}_{timestamp}.png"
+            try:
+                take_screenshot(self.adb_path, filename)
+                print(f"📸 Saved screenshot to {filename}")
+            except Exception as e:
+                print(f"⚠️ Failed to save screenshot: {e}")
+                
         next_action = self.planner.plan_action(
             self.goal,
             self.options.additional_context,
@@ -501,43 +662,116 @@ class AndroidAgent:
             self.history
         )
         
-        # Check if goal has been achieved or failed
+        if not next_action:
+            print("❌ Failed to determine next action")
+            self.update_status(AndroidGoalState.FAILED)
+            return
+            
+        # Record that we're starting a specific action
+        action_desc = f"{next_action.action}"
+        if next_action.action == AndroidActionType.TAP and next_action.coordinate:
+            action_desc = f"{next_action.action} at ({next_action.coordinate.x:.0f}, {next_action.coordinate.y:.0f})"
+        elif next_action.action == AndroidActionType.TYPE and next_action.text:
+            action_desc = f"{next_action.action} \"{next_action.text}\""
+            
+        print(f"🤖 Next action: {action_desc}")
+        
+        # Check if we've reached a success or failure action
         if next_action.action == AndroidActionType.SUCCESS:
-            self._status = AndroidGoalState.SUCCESS
-            print("✅ Goal achieved successfully!")
+            print("🎯 Goal reached!")
+            self.update_status(AndroidGoalState.SUCCESS)
             return
         elif next_action.action == AndroidActionType.FAILURE:
-            self._status = AndroidGoalState.FAILED
-            print("❌ Failed to achieve goal.")
-            return
-        else:
-            self._status = AndroidGoalState.RUNNING
-        
-        # Update action counts
-        self.action_counts[next_action.action] += 1
-        
-        # Check for excessive use of the same action type
-        if self.action_counts[next_action.action] > 5:
-            print(f"⚠️ Warning: Excessive use of {next_action.action} action")
-            self._status = AndroidGoalState.FAILED
+            print("❌ Failed to achieve goal")
+            self.update_status(AndroidGoalState.FAILED)
             return
         
-        # Execute the action
-        action_success = self._take_action(next_action)
-        
-        # Record this step in history regardless of success (to learn from failures)
-        self.history.append(AndroidStep(state=current_state, action=next_action))
-        
-        # Pause if configured to do so
-        if self.options.pause_after_each_action:
-            input("Press Enter to continue...")
+        # Special case for opening Chrome - use direct launch if possible
+        if next_action.action == AndroidActionType.TAP:
+            is_chrome_target = False
             
-        # Handle action failure
-        if not action_success:
-            print("❌ Action failed, but will try again with a different approach")
-            # Set flag to force the planner to try something different next time
-            self.repeated_states = self.max_repeated_states - 1
-            return
+            # Check if we're trying to tap on what might be the Chrome icon
+            if "chrome" in str(current_state.current_app).lower():
+                is_chrome_target = True
+            elif "launcher" in str(current_state.current_app).lower():
+                # If we're on the launcher and the tap is in the bottom dock area
+                # it's likely we're trying to tap on Chrome
+                if next_action.coordinate and next_action.coordinate.y > 0.8:
+                    is_chrome_target = True
+                    
+            if is_chrome_target:
+                print("🌐 Detected possible Chrome icon tap - trying Chrome-specific strategies")
+                
+                # First, try a specialized Chrome launch command (more reliable than LAUNCH_APP)
+                # This uses am start with the explicit Chrome launcher activity
+                chrome_launch_cmd = f"{self.adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main"
+                
+                try:
+                    print("🌐 Executing Chrome-specific launch command...")
+                    result = subprocess.run(chrome_launch_cmd, shell=True, capture_output=True, text=True)
+                    
+                    if result.returncode == 0 and "Error" not in result.stdout:
+                        print("✅ Chrome-specific launch command successful")
+                        time.sleep(2)  # Give Chrome time to start
+                        
+                        # Record this as a successful tap action
+                        self.history.append(AndroidStep(
+                            state=current_state,
+                            action=next_action
+                        ))
+                        return
+                    else:
+                        print(f"⚠️ Chrome-specific launch failed: {result.stderr}")
+                except Exception as e:
+                    print(f"⚠️ Error launching Chrome: {e}")
+                
+                # If direct command failed, try alternative Chrome packages
+                chrome_packages = [
+                    "com.android.chrome",
+                    "com.chrome.beta",
+                    "com.google.android.apps.chrome",
+                ]
+                
+                for package in chrome_packages:
+                    try:
+                        print(f"🌐 Trying to launch {package}...")
+                        alt_cmd = f"{self.adb_path} shell monkey -p {package} -c android.intent.category.LAUNCHER 1"
+                        result = subprocess.run(alt_cmd, shell=True, capture_output=True, text=True)
+                        
+                        if "Events injected: 1" in result.stdout:
+                            print(f"✅ Successfully launched Chrome via {package}")
+                            time.sleep(2)
+                            
+                            # Record this as a successful tap action
+                            self.history.append(AndroidStep(
+                                state=current_state,
+                                action=next_action
+                            ))
+                            return
+                    except Exception as e:
+                        print(f"⚠️ Error with alternative Chrome launch: {e}")
+                
+                print("🔍 Falling back to standard tap method")
+                # Continue with original tap action below
+            
+        # Execute the action
+        action_result = self._take_action(next_action)
+        
+        # If the action failed to execute, mark step as failed
+        if not action_result:
+            print("❌ Action failed to execute")
+            next_action.failed = True
+            
+        # Record the step with the current state and action taken
+        self.history.append(AndroidStep(
+            state=current_state,
+            action=next_action
+        ))
+        
+        # Check if we've reached the maximum steps
+        if len(self.history) >= self.options.max_steps:
+            print("⚠️ Maximum number of steps reached")
+            self.update_status(AndroidGoalState.FAILED)
     
     def start(self) -> None:
         """Start the Android automation process.
@@ -574,3 +808,11 @@ class AndroidAgent:
             Current status as AndroidGoalState
         """
         return self._status
+
+    def update_status(self, new_status: AndroidGoalState) -> None:
+        """Update the current status of the automation.
+        
+        Args:
+            new_status: New status to set
+        """
+        self._status = new_status

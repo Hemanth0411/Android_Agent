@@ -221,78 +221,237 @@ Your response must be formatted as follows:
                 print(f"📝 JSON text: {json_text}")
                 return self._infer_action_from_text(response_text)
             
+            # Create mapping from various action names to correct enum values
+            action_map = {
+                "tap": AndroidActionType.TAP,
+                "click": AndroidActionType.TAP,
+                "type": AndroidActionType.TYPE,
+                "input": AndroidActionType.TYPE,
+                "press": AndroidActionType.PRESS,
+                "swipe": AndroidActionType.SWIPE,
+                "swipe_up": AndroidActionType.SWIPE_UP,
+                "swipeup": AndroidActionType.SWIPE_UP,
+                "swipe_down": AndroidActionType.SWIPE_DOWN,
+                "swipedown": AndroidActionType.SWIPE_DOWN,
+                "screenshot": AndroidActionType.SCREENSHOT,
+                "launch_app": AndroidActionType.LAUNCH_APP,
+                "launchapp": AndroidActionType.LAUNCH_APP,
+                "success": AndroidActionType.SUCCESS,
+                "failure": AndroidActionType.FAILURE,
+                "back": AndroidActionType.PRESS,  # Map back to PRESS with key=4
+                "home": AndroidActionType.PRESS,  # Map home to PRESS with key=3
+            }
+            
             # Check if action key exists
-            if "action" not in action_json:
-                if "action_type" in action_json:
-                    print("⚠️ Found 'action_type' instead of 'action' - converting")
-                    action_json["action"] = action_json["action_type"]
+            action_key = None
+            for key in ["action", "action_type", "type"]:
+                if key in action_json:
+                    action_key = key
+                    break
+                    
+            if not action_key:
+                print(f"❌ Missing action field in JSON: {action_json}")
+                return self._infer_action_from_text(response_text)
+            
+            # Get action type and normalize to lowercase
+            action_type = action_json[action_key].lower()
+            
+            # Map the action type to the correct enum value
+            if action_type not in action_map:
+                print(f"⚠️ Unknown action type: {action_type}, trying to find closest match")
+                # Try to find a partial match
+                for key in action_map:
+                    if key in action_type:
+                        action_type = key
+                        print(f"✅ Matched partial action: {key}")
+                        break
                 else:
-                    print(f"❌ Missing 'action' field in JSON: {action_json}")
+                    print(f"❌ No match found for action type: {action_type}")
                     return self._infer_action_from_text(response_text)
             
-            # Create appropriate action based on type
-            action_type = action_json.get("action", "").lower()
+            mapped_action_type = action_map[action_type]
             
-            if action_type == "tap":
+            # Handle different action types
+            if mapped_action_type == AndroidActionType.TAP:
                 if "x" not in action_json or "y" not in action_json:
-                    print(f"❌ Missing coordinates for tap: {action_json}")
-                    return self._infer_action_from_text(response_text)
+                    # Try alternative coordinate formats
+                    if "coordinate" in action_json and isinstance(action_json["coordinate"], dict):
+                        x = action_json["coordinate"].get("x")
+                        y = action_json["coordinate"].get("y")
+                    elif "coordinates" in action_json and isinstance(action_json["coordinates"], list):
+                        if len(action_json["coordinates"]) >= 2:
+                            x, y = action_json["coordinates"][0], action_json["coordinates"][1]
+                        else:
+                            print(f"❌ Invalid coordinates format: {action_json}")
+                            return self._infer_action_from_text(response_text)
+                    else:
+                        print(f"❌ Missing coordinates for tap: {action_json}")
+                        return self._infer_action_from_text(response_text)
+                else:
+                    x, y = action_json["x"], action_json["y"]
                 
-                return AndroidAction(
-                    action=AndroidActionType.TAP,
-                    coordinate=Coordinate(
-                        x=int(action_json["x"] * 1000),
-                        y=int(action_json["y"] * 1000)
+                # Convert coordinates to proper format (normalize if needed)
+                try:
+                    x_val = float(x)
+                    y_val = float(y)
+                    
+                    # If values are between 0-1, they're normalized
+                    if 0 <= x_val <= 1 and 0 <= y_val <= 1:
+                        x_val = int(x_val * 1000)
+                        y_val = int(y_val * 1000)
+                    else:
+                        # Values might already be in pixel coordinates
+                        x_val = int(x_val)
+                        y_val = int(y_val)
+                        
+                    return AndroidAction(
+                        action=AndroidActionType.TAP,
+                        coordinate=Coordinate(x=x_val, y=y_val)
                     )
-                )
-            elif action_type == "type":
-                if "text" not in action_json:
+                except (TypeError, ValueError) as e:
+                    print(f"❌ Error processing tap coordinates: {e}")
+                    return self._infer_action_from_text(response_text)
+                    
+            elif mapped_action_type == AndroidActionType.TYPE:
+                # Look for text in various fields
+                text = None
+                for field in ["text", "input", "value", "content"]:
+                    if field in action_json:
+                        text = action_json[field]
+                        break
+                        
+                if not text:
                     print(f"❌ Missing text for typing: {action_json}")
                     return self._infer_action_from_text(response_text)
                 
                 return AndroidAction(
                     action=AndroidActionType.TYPE,
-                    text=action_json["text"]
+                    text=text
                 )
-            elif action_type == "press":
-                if "key" not in action_json:
-                    print(f"❌ Missing key for press: {action_json}")
-                    return self._infer_action_from_text(response_text)
                 
-                key = 4 if action_json["key"] == "back" else 3  # 4 is back, 3 is home
+            elif mapped_action_type == AndroidActionType.PRESS:
+                # Handle different key formats and special cases
+                if action_type == "back":
+                    key = 4  # KEYCODE_BACK
+                elif action_type == "home":
+                    key = 3  # KEYCODE_HOME
+                else:
+                    # Try to extract key from the action
+                    key = action_json.get("key")
+                    if key is None:
+                        if "back" in str(action_json).lower():
+                            key = 4
+                        elif "home" in str(action_json).lower():
+                            key = 3
+                        else:
+                            print(f"❌ Missing or invalid key for press: {action_json}")
+                            return self._infer_action_from_text(response_text)
+                
+                # Convert key to integer if it's a string
+                if isinstance(key, str):
+                    try:
+                        key = int(key)
+                    except ValueError:
+                        # Map string keys to their values
+                        key_map = {"back": 4, "home": 3}
+                        key = key_map.get(key.lower(), 0)
+                        
                 return AndroidAction(
                     action=AndroidActionType.PRESS,
                     key=key
                 )
-            elif action_type == "swipe":
-                if "start_x" not in action_json or "start_y" not in action_json or "end_x" not in action_json or "end_y" not in action_json:
+                
+            elif mapped_action_type == AndroidActionType.SWIPE:
+                # Handle various swipe coordinate formats
+                start_x, start_y, end_x, end_y = None, None, None, None
+                
+                # Format 1: Explicit coordinates
+                if all(k in action_json for k in ["start_x", "start_y", "end_x", "end_y"]):
+                    start_x = action_json["start_x"]
+                    start_y = action_json["start_y"]
+                    end_x = action_json["end_x"]
+                    end_y = action_json["end_y"]
+                # Format 2: x, y, end_x, end_y
+                elif all(k in action_json for k in ["x", "y", "end_x", "end_y"]):
+                    start_x = action_json["x"]
+                    start_y = action_json["y"]
+                    end_x = action_json["end_x"]
+                    end_y = action_json["end_y"]
+                # Format 3: from and to objects
+                elif "from" in action_json and "to" in action_json:
+                    start_x = action_json["from"].get("x")
+                    start_y = action_json["from"].get("y")
+                    end_x = action_json["to"].get("x")
+                    end_y = action_json["to"].get("y")
+                # Format 4: start and end objects
+                elif "start" in action_json and "end" in action_json:
+                    start_x = action_json["start"].get("x")
+                    start_y = action_json["start"].get("y")
+                    end_x = action_json["end"].get("x")
+                    end_y = action_json["end"].get("y")
+                else:
                     print(f"❌ Missing coordinates for swipe: {action_json}")
                     return self._infer_action_from_text(response_text)
                 
-                return AndroidAction(
-                    action=AndroidActionType.SWIPE,
-                    swipe=SwipeCoordinates(
-                        start=Coordinate(
-                            x=int(action_json["start_x"] * 1000),
-                            y=int(action_json["start_y"] * 1000)
-                        ),
-                        end=Coordinate(
-                            x=int(action_json["end_x"] * 1000),
-                            y=int(action_json["end_y"] * 1000)
-                        ),
-                        duration=action_json.get("duration", 100)
+                # Validate and normalize coordinates
+                try:
+                    start_x = float(start_x)
+                    start_y = float(start_y)
+                    end_x = float(end_x)
+                    end_y = float(end_y)
+                    
+                    # If values are between 0-1, they're normalized
+                    if all(0 <= v <= 1 for v in [start_x, start_y, end_x, end_y]):
+                        start_x = int(start_x * 1000)
+                        start_y = int(start_y * 1000)
+                        end_x = int(end_x * 1000)
+                        end_y = int(end_y * 1000)
+                    else:
+                        # Values might already be in pixel coordinates
+                        start_x = int(start_x)
+                        start_y = int(start_y)
+                        end_x = int(end_x)
+                        end_y = int(end_y)
+                        
+                    duration = action_json.get("duration", 100)
+                    
+                    return AndroidAction(
+                        action=AndroidActionType.SWIPE,
+                        swipe=SwipeCoordinates(
+                            start=Coordinate(x=start_x, y=start_y),
+                            end=Coordinate(x=end_x, y=end_y),
+                            duration=duration
+                        )
                     )
+                except (TypeError, ValueError) as e:
+                    print(f"❌ Error processing swipe coordinates: {e}")
+                    return self._infer_action_from_text(response_text)
+                    
+            elif mapped_action_type in [AndroidActionType.SWIPE_UP, AndroidActionType.SWIPE_DOWN]:
+                return AndroidAction(action=mapped_action_type)
+                
+            elif mapped_action_type == AndroidActionType.LAUNCH_APP:
+                # Look for app name in various fields
+                app_name = None
+                for field in ["text", "app", "package", "name"]:
+                    if field in action_json:
+                        app_name = action_json[field]
+                        break
+                        
+                if not app_name:
+                    print(f"❌ Missing app name for launch: {action_json}")
+                    return self._infer_action_from_text(response_text)
+                
+                return AndroidAction(
+                    action=AndroidActionType.LAUNCH_APP,
+                    text=app_name
                 )
-            elif action_type == "success":
-                return AndroidAction(action=AndroidActionType.SUCCESS)
-            elif action_type == "failure":
-                return AndroidAction(action=AndroidActionType.FAILURE)
-            elif action_type in ("home", "back"):
-                # Handle these directly
-                key = 3 if action_type == "home" else 4
-                return AndroidAction(action=AndroidActionType.PRESS, key=key)
+                
+            elif mapped_action_type in [AndroidActionType.SUCCESS, AndroidActionType.FAILURE]:
+                return AndroidAction(action=mapped_action_type)
+                
             else:
-                print(f"⚠️ Unknown action type: {action_type}")
+                print(f"⚠️ Unhandled action type: {mapped_action_type}")
                 return self._infer_action_from_text(response_text)
                 
         except Exception as e:
@@ -318,12 +477,22 @@ Your response must be formatted as follows:
         action_map = {
             "go home": (AndroidActionType.PRESS, 3),
             "press home": (AndroidActionType.PRESS, 3),
+            "home screen": (AndroidActionType.PRESS, 3),
+            "return to home": (AndroidActionType.PRESS, 3),
             "go back": (AndroidActionType.PRESS, 4),
             "press back": (AndroidActionType.PRESS, 4), 
+            "return to previous": (AndroidActionType.PRESS, 4),
             "task completed": (AndroidActionType.SUCCESS, None),
             "goal achieved": (AndroidActionType.SUCCESS, None),
+            "mission accomplished": (AndroidActionType.SUCCESS, None),
+            "completed successfully": (AndroidActionType.SUCCESS, None),
             "cannot complete": (AndroidActionType.FAILURE, None),
             "unable to proceed": (AndroidActionType.FAILURE, None),
+            "failed to achieve": (AndroidActionType.FAILURE, None),
+            "scroll up": (AndroidActionType.SWIPE_UP, None),
+            "scroll down": (AndroidActionType.SWIPE_DOWN, None),
+            "swipe up": (AndroidActionType.SWIPE_UP, None),
+            "swipe down": (AndroidActionType.SWIPE_DOWN, None),
         }
         
         # Check for exact phrases first
@@ -336,87 +505,199 @@ Your response must be formatted as follows:
                     return AndroidAction(action=action_type)
         
         # Look for success or failure indications
-        if "success" in text or "goal achieved" in text or "task complete" in text:
+        if any(word in text for word in ["success", "goal achieved", "task complete", "done", "finished", "completed"]):
             print("✅ Success detected in text")
             return AndroidAction(action=AndroidActionType.SUCCESS)
         
-        if "fail" in text or "cannot" in text or "unable" in text:
+        if any(word in text for word in ["fail", "cannot", "unable", "couldn't", "error", "issue"]):
             print("❌ Failure detected in text")
             return AndroidAction(action=AndroidActionType.FAILURE)
         
         # Check for home command first (high priority)
-        if re.search(r'\bhome\b', text):
+        if re.search(r'\b(home|main screen|launcher)\b', text):
             print("🏠 Home command detected")
             return AndroidAction(action=AndroidActionType.PRESS, key=3)  # 3 is home
             
         # Check for back command first (high priority)
-        if re.search(r'\bback\b', text):
+        if re.search(r'\b(back|previous|return)\b', text):
             print("⬅️ Back command detected")
             return AndroidAction(action=AndroidActionType.PRESS, key=4)  # 4 is back
         
-        # Look for tap indications
-        tap_match = re.search(r'(?:tap|click).*?(\d+\.?\d*).*?(\d+\.?\d*)', text)
-        if tap_match:
-            try:
-                x = float(tap_match.group(1))
-                y = float(tap_match.group(2))
-                print(f"👆 Tap detected at coordinates ({x}, {y})")
-                return AndroidAction(
-                    action=AndroidActionType.TAP,
-                    coordinate=Coordinate(x=int(x * 1000), y=int(y * 1000))
-                )
-            except (ValueError, IndexError) as e:
-                print(f"❌ Error parsing tap coordinates: {e}")
+        # Look for type/input actions (high priority, check before tap)
+        type_patterns = [
+            r'type\s+["\'](.+?)["\']',
+            r'input\s+["\'](.+?)["\']',
+            r'enter\s+["\'](.+?)["\']',
+            r'write\s+["\'](.+?)["\']',
+            r'text\s+["\'](.+?)["\']',
+            r'keyboard\s+["\'](.+?)["\']',
+        ]
         
-        # Look for swipe indications
-        swipe_match = re.search(r'swipe.*?from.*?(\d+\.?\d*).*?(\d+\.?\d*).*?to.*?(\d+\.?\d*).*?(\d+\.?\d*)', text)
-        if swipe_match:
-            try:
-                start_x = float(swipe_match.group(1))
-                start_y = float(swipe_match.group(2))
-                end_x = float(swipe_match.group(3))
-                end_y = float(swipe_match.group(4))
-                print(f"👆 Swipe detected from ({start_x}, {start_y}) to ({end_x}, {end_y})")
+        for pattern in type_patterns:
+            type_match = re.search(pattern, text)
+            if type_match:
+                text_content = type_match.group(1)
+                print(f"⌨️ Type detected: '{text_content}'")
                 return AndroidAction(
-                    action=AndroidActionType.SWIPE,
-                    swipe=SwipeCoordinates(
-                        start=Coordinate(x=int(start_x * 1000), y=int(start_y * 1000)),
-                        end=Coordinate(x=int(end_x * 1000), y=int(end_y * 1000)),
-                        duration=100
+                    action=AndroidActionType.TYPE,
+                    text=text_content
+                )
+        
+        # Look for tap indications with various formats
+        tap_patterns = [
+            # Standard tap with coordinates
+            r'(?:tap|click|touch|press).*?(\d+\.?\d*).*?(\d+\.?\d*)',
+            # Tap with normalized coordinates in various formats
+            r'(?:tap|click|touch|press).*?coordinates?\s*\(?\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*\)?',
+            r'(?:tap|click|touch|press).*?at position\s*\(?\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*\)?',
+            r'(?:tap|click|touch|press).*?location\s*\(?\s*(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\s*\)?',
+            # Tap with x= y= format
+            r'(?:tap|click|touch|press).*?x\s*=\s*(\d+\.?\d*).*?y\s*=\s*(\d+\.?\d*)',
+        ]
+        
+        for pattern in tap_patterns:
+            tap_match = re.search(pattern, text)
+            if tap_match:
+                try:
+                    x = float(tap_match.group(1))
+                    y = float(tap_match.group(2))
+                    print(f"👆 Tap detected at coordinates ({x}, {y})")
+                    
+                    # Convert coordinates if necessary
+                    if 0 <= x <= 1 and 0 <= y <= 1:  # Normalized
+                        x = int(x * 1000)
+                        y = int(y * 1000)
+                    else:  # Raw pixel values or other format
+                        x = int(x)
+                        y = int(y)
+                        
+                    return AndroidAction(
+                        action=AndroidActionType.TAP,
+                        coordinate=Coordinate(x=x, y=y)
                     )
-                )
-            except (ValueError, IndexError) as e:
-                print(f"❌ Error parsing swipe coordinates: {e}")
+                except (ValueError, IndexError) as e:
+                    print(f"❌ Error parsing tap coordinates: {e}")
+                    continue
         
-        # Look for swipe up/down
-        if "swipe up" in text:
+        # Check for tap/click action mentions without coordinates
+        if any(word in text for word in ["tap", "click", "touch", "press"]):
+            # If we found tap/click action but no coordinates, search for numbers in proximity
+            num_pattern = r'(\d+\.?\d*)[^\d]+(\d+\.?\d*)'
+            num_match = re.search(num_pattern, text)
+            if num_match:
+                try:
+                    x = float(num_match.group(1))
+                    y = float(num_match.group(2))
+                    print(f"👆 Tap coordinates extracted: ({x}, {y})")
+                    
+                    # Convert coordinates if necessary
+                    if 0 <= x <= 1 and 0 <= y <= 1:  # Normalized
+                        x = int(x * 1000)
+                        y = int(y * 1000)
+                    else:  # Raw pixel values
+                        x = int(x)
+                        y = int(y)
+                        
+                    return AndroidAction(
+                        action=AndroidActionType.TAP,
+                        coordinate=Coordinate(x=x, y=y)
+                    )
+                except (ValueError, IndexError) as e:
+                    print(f"❌ Error extracting tap coordinates: {e}")
+        
+        # Look for swipe with detailed patterns
+        swipe_patterns = [
+            r'swipe.*?from.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?.*?to.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?',
+            r'swipe.*?start.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?.*?end.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?',
+            r'drag.*?from.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?.*?to.*?\(?(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\)?',
+        ]
+        
+        for pattern in swipe_patterns:
+            swipe_match = re.search(pattern, text)
+            if swipe_match:
+                try:
+                    start_x = float(swipe_match.group(1))
+                    start_y = float(swipe_match.group(2))
+                    end_x = float(swipe_match.group(3))
+                    end_y = float(swipe_match.group(4))
+                    print(f"👆 Swipe detected from ({start_x}, {start_y}) to ({end_x}, {end_y})")
+                    
+                    # Convert coordinates if necessary
+                    if 0 <= start_x <= 1 and 0 <= start_y <= 1 and 0 <= end_x <= 1 and 0 <= end_y <= 1:
+                        start_x = int(start_x * 1000)
+                        start_y = int(start_y * 1000)
+                        end_x = int(end_x * 1000)
+                        end_y = int(end_y * 1000)
+                    else:
+                        start_x = int(start_x)
+                        start_y = int(start_y)
+                        end_x = int(end_x)
+                        end_y = int(end_y)
+                        
+                    return AndroidAction(
+                        action=AndroidActionType.SWIPE,
+                        swipe=SwipeCoordinates(
+                            start=Coordinate(x=start_x, y=start_y),
+                            end=Coordinate(x=end_x, y=end_y),
+                            duration=100
+                        )
+                    )
+                except (ValueError, IndexError) as e:
+                    print(f"❌ Error parsing swipe coordinates: {e}")
+                    continue
+        
+        # Look for swipe up/down directions
+        if any(phrase in text for phrase in ["swipe up", "scroll up", "flick up"]):
             print("👆 Swipe up detected")
             return AndroidAction(action=AndroidActionType.SWIPE_UP)
         
-        if "swipe down" in text:
+        if any(phrase in text for phrase in ["swipe down", "scroll down", "flick down"]):
             print("👇 Swipe down detected")
             return AndroidAction(action=AndroidActionType.SWIPE_DOWN)
         
-        # Look for typing
-        type_match = re.search(r'type.*[\'"](.+?)[\'"]', text)
-        if type_match:
-            text_content = type_match.group(1)
-            print(f"⌨️ Type detected: '{text_content}'")
-            return AndroidAction(
-                action=AndroidActionType.TYPE,
-                text=text_content
-            )
-        
         # Look for launch app
-        launch_match = re.search(r'launch.*?[\'"](.+?)[\'"]', text)
-        if launch_match:
-            app_name = launch_match.group(1)
-            print(f"🚀 Launch app detected: '{app_name}'")
-            return AndroidAction(
-                action=AndroidActionType.LAUNCH_APP,
-                text=app_name
-            )
+        launch_patterns = [
+            r'launch.*?[\'"](.+?)[\'"]',
+            r'open app.*?[\'"](.+?)[\'"]',
+            r'start.*?app.*?[\'"](.+?)[\'"]',
+            r'open.*?application.*?[\'"](.+?)[\'"]',
+        ]
         
+        for pattern in launch_patterns:
+            launch_match = re.search(pattern, text)
+            if launch_match:
+                app_name = launch_match.group(1)
+                print(f"🚀 Launch app detected: '{app_name}'")
+                return AndroidAction(
+                    action=AndroidActionType.LAUNCH_APP,
+                    text=app_name
+                )
+        
+        # If we found "type" keyword but no matching pattern earlier, look for any quoted text
+        if any(word in text for word in ["type", "input", "enter", "write", "text"]):
+            # Try to find any quoted text
+            quoted_match = re.search(r'[\'"](.+?)[\'"]', text)
+            if quoted_match:
+                text_content = quoted_match.group(1)
+                print(f"⌨️ Type content extracted from quotes: '{text_content}'")
+                return AndroidAction(
+                    action=AndroidActionType.TYPE,
+                    text=text_content
+                )
+            else:
+                # If no quoted text found, try to find text after one of these keywords
+                for keyword in ["type", "input", "enter", "write", "text"]:
+                    if keyword in text:
+                        parts = text.split(keyword, 1)[1].strip()
+                        # Take just the first line or sentence
+                        parts = parts.split('\n')[0].split('.')[0].strip()
+                        if parts and len(parts) < 100:  # Limit to reasonable text length
+                            print(f"⌨️ Type content extracted after keyword: '{parts}'")
+                            return AndroidAction(
+                                action=AndroidActionType.TYPE,
+                                text=parts
+                            )
+                            
         # Default to pressing home if we can't determine an action
         print("⚠️ Couldn't determine action from text, defaulting to home")
         return AndroidAction(action=AndroidActionType.PRESS, key=3)

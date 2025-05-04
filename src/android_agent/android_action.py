@@ -12,6 +12,7 @@ class AndroidActionType(str, Enum):
     SWIPE_DOWN = "swipe_down"
     SCREENSHOT = "screenshot"
     LAUNCH_APP = "launch_app"
+    WAIT = "wait"
     SUCCESS = "success"
     FAILURE = "failure"
 
@@ -35,4 +36,8 @@ class AndroidAction:
     coordinate: Optional[Coordinate] = None
     text: Optional[str] = None
     key: Optional[int] = None
-    swipe: Optional[SwipeCoordinates] = None 
+    swipe: Optional[SwipeCoordinates] = None
+    package: Optional[str] = None  # Package name for LAUNCH_APP action
+    activity: Optional[str] = None  # Activity name for LAUNCH_APP action
+    duration: Optional[int] = None  # Duration for wait actions
+    failed: bool = False  # Whether the action failed to execute 
