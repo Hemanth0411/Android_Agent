@@ -10,6 +10,7 @@ import subprocess
 import time
 import importlib.util
 from typing import Tuple, Optional, Union, Dict, Any
+import re
 
 
 def get_device_size(adb_path: str) -> Tuple[int, int]:
@@ -21,11 +22,32 @@ def get_device_size(adb_path: str) -> Tuple[int, int]:
     Returns:
         Tuple containing width and height of device screen
     """
+    # Query physical screen size via ADB and parse robustly
     command = f"{adb_path} shell wm size"
     result = subprocess.run(command, capture_output=True, text=True, shell=True)
-    resolution_line = result.stdout.strip().split('\n')[-1]
-    width, height = map(int, resolution_line.split(' ')[-1].split('x'))
-    return width, height
+    output = result.stdout or ''
+    # Look for first occurrence of WxH pattern
+    for line in output.splitlines():
+        m = re.search(r"(\d+)x(\d+)", line)
+        if m:
+            try:
+                width, height = int(m.group(1)), int(m.group(2))
+                return width, height
+            except ValueError:
+                continue
+    # Fallback: try dumpsys display
+    try:
+        command2 = f"{adb_path} shell dumpsys display"
+        result2 = subprocess.run(command2, capture_output=True, text=True, shell=True)
+        for line in (result2.stdout or '').splitlines():
+            m2 = re.search(r"mBaseDisplayInfo=.*?size=\[?(\d+),(\d+)\]", line)
+            if m2:
+                return int(m2.group(1)), int(m2.group(2))
+    except Exception:
+        pass
+    # Last resort values or raise
+    print("⚠️ Unable to detect device size, defaulting to 1080x1920")
+    return 1080, 1920
 
 
 def take_screenshot(adb_path: str, output_path: str = "screenshot.png") -> str:
@@ -165,13 +187,55 @@ def get_screenshot_base64(adb_path: str, temp_path: str = "temp_screenshot.png")
                 print(f"⚠️ Warning: Failed to clean up temporary screenshot: {e}")
 
 
+def calculate_app_grid_position(adb_path: str, app_index: int, total_apps: int = 20) -> Tuple[int, int]:
+    """Calculate the tap coordinates for an app in the app grid.
+    
+    Args:
+        adb_path: Path to ADB executable
+        app_index: Index of the app in the grid (0-based)
+        total_apps: Total number of apps to consider for grid layout
+        
+    Returns:
+        Tuple of (x, y) coordinates in pixels
+    """
+    # Get device dimensions
+    width, height = get_device_size(adb_path)
+    
+    # Define grid layout (typical Android layout)
+    columns = 4  # Most Android devices show 4 columns
+    rows = 5     # Typical number of visible rows
+    
+    # Calculate cell size
+    cell_width = width / columns
+    cell_height = (height * 0.7) / rows  # Use only 70% of height to avoid system UI
+    
+    # Calculate position in grid
+    row = (app_index // columns) 
+    col = (app_index % columns)
+    
+    # Calculate center of cell
+    x = (col * cell_width) + (cell_width / 2)
+    y = (row * cell_height) + (cell_height / 2) + (height * 0.15)  # Add 15% offset from top
+    
+    return (int(x), int(y))
+
+
+def tap_app_by_index(adb_path: str, app_index: int) -> bool:
+    """Tap an app by its position in the app grid.
+    
+    Args:
+        adb_path: Path to ADB executable
+        app_index: Index of the app in the grid (0-based)
+        
+    Returns:
+        bool: Whether tap was successful
+    """
+    x, y = calculate_app_grid_position(adb_path, app_index)
+    return tap(adb_path, x, y)
+
+
 def tap(adb_path: str, x: float, y: float, device_width: Optional[int] = None, device_height: Optional[int] = None) -> bool:
     """Tap at specified coordinates with enhanced reliability.
-    
-    Applies multiple strategies to ensure tap commands are successfully executed:
-    1. Uses standard input tap command with retries
-    2. Falls back to swipe-based tap simulation if needed
-    3. Uses enhanced error reporting and diagnosis
     
     Args:
         adb_path: Path to ADB executable
@@ -184,134 +248,53 @@ def tap(adb_path: str, x: float, y: float, device_width: Optional[int] = None, d
         bool: Whether the tap succeeded
     """
     try:
-        # If coordinates are normalized (between 0-1), convert to pixels
-        if 0 <= x <= 1 and 0 <= y <= 1:
-            if device_width is None or device_height is None:
-                device_width, device_height = get_device_size(adb_path)
-            x = int(x * device_width)
-            y = int(y * device_height)
-        else:
-            # Ensure coordinates are integers
-            x, y = int(x), int(y)
-            
-        # Validate coordinates are within screen bounds
+        # Add system UI protection
+        SYSTEM_UI_TOP = 0.1    # Top 10% reserved for status bar
+        SYSTEM_UI_BOTTOM = 0.9 # Bottom 10% reserved for navigation
+        
+        # If no device dimensions provided, get them
         if device_width is None or device_height is None:
             device_width, device_height = get_device_size(adb_path)
             
-        if x < 0 or x > device_width or y < 0 or y > device_height:
-            print(f"⚠️ Tap coordinates ({x},{y}) are outside screen bounds ({device_width}x{device_height})")
-            return False
+        # Scale coordinates correctly
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            # Convert from normalized coordinates to pixels
+            x = int(x * device_width)
+            y = int(y * device_height)
             
+            # Apply system UI protection
+            y = max(device_height * SYSTEM_UI_TOP, min(y, device_height * SYSTEM_UI_BOTTOM))
+        else:
+            # Round to integers if they're already in pixels
+            x = round(x)
+            y = round(y)
+            
+            # Apply system UI protection in pixels
+            y = max(int(device_height * SYSTEM_UI_TOP), min(y, int(device_height * SYSTEM_UI_BOTTOM)))
+        
         print(f"👆 Tapping at ({x},{y})")
         
-        # Record app before any tap attempts
-        before_app = get_current_app(adb_path)
-        
-        # Try multiple tap approaches in sequence until we see actual app change
-        # Strategy 1: Standard tap approach
-        print("🔍 Trying standard tap method...")
-        command_1 = f"{adb_path} shell input tap {x} {y}"
-        result_1 = subprocess.run(command_1, capture_output=True, text=True, shell=True)
-        
-        # Check if first tap command worked
-        if result_1.returncode == 0:
-            print(f"✅ Command execution successful")
-            # Longer wait to let UI respond
-            time.sleep(2.0)  
+        # Try up to 3 times
+        for attempt in range(3):
+            if attempt > 0:
+                print(f"Retrying tap (attempt {attempt + 1}/3)...")
+                
+            command = f"{adb_path} shell input tap {x} {y}"
+            result = subprocess.run(command, capture_output=True, text=True, shell=True)
             
-            # Check if app changed
-            after_app_1 = get_current_app(adb_path)
-            if before_app != after_app_1 and "launcher" not in after_app_1.lower():
-                print(f"✅ Tap successful - app changed from {before_app} to {after_app_1}")
+            if result.returncode == 0:
+                print("✅ Tap command executed")
+                time.sleep(1.5)  # Increased delay after tap
                 return True
-            else:
-                print(f"ℹ️ Tap command executed, but no actual app change detected")
-                # Continue to try alternative methods
-        else:
-            print(f"⚠️ Primary tap command failed: {result_1.stderr}")
-        
-        # Strategy 2: Try multiple taps in quick succession
-        print("🔍 Trying multiple tap method...")
-        for i in range(3):
-            command_multi = f"{adb_path} shell input tap {x} {y}"
-            subprocess.run(command_multi, capture_output=True, text=True, shell=True)
-            time.sleep(0.5)
-        
-        # Wait longer for multiple taps to take effect
-        time.sleep(2.0)
-        
-        # Check if app changed after multiple taps
-        after_app_multi = get_current_app(adb_path)
-        if before_app != after_app_multi and "launcher" not in after_app_multi.lower():
-            print(f"✅ Multiple tap method successful - app changed to {after_app_multi}")
-            return True
-            
-        # Strategy 3: Try device-specific tap if not already specified
-        if "-s" not in adb_path:
-            print("🔍 Trying device-specific tap method...")
-            devices_output = subprocess.run(f"{adb_path} devices", shell=True, capture_output=True, text=True).stdout
-            device_id = devices_output.strip().split('\n')[1].split('\t')[0] if len(devices_output.strip().split('\n')) > 1 else None
-            
-            if device_id:
-                command_2 = f"{adb_path} -s {device_id} shell input tap {x} {y}"
-                subprocess.run(command_2, capture_output=True, text=True, shell=True)
                 
-                # Wait for UI to respond
-                time.sleep(2.0)
-                
-                # Check for app change 
-                after_app_2 = get_current_app(adb_path)
-                if before_app != after_app_2 and "launcher" not in after_app_2.lower():
-                    print(f"✅ Device-specific tap successful - app changed to {after_app_2}")
-                    return True
-                else:
-                    print(f"⚠️ Device-specific tap executed, but didn't change app")
-            else:
-                print("⚠️ Could not identify device ID for specific tap")
-        
-        # Strategy 4: Use long-press with very short duration as tap alternative
-        print("🔍 Trying long-press tap method...")
-        long_press_command = f"{adb_path} shell input swipe {x} {y} {x} {y} 50"
-        subprocess.run(long_press_command, capture_output=True, text=True, shell=True)
-        
-        # Wait for UI to respond
-        time.sleep(2.0)
-        
-        # Check for app change
-        after_app_long = get_current_app(adb_path)
-        if before_app != after_app_long and "launcher" not in after_app_long.lower():
-            print(f"✅ Long-press tap successful - app changed to {after_app_long}")
-            return True
-        else:
-            print(f"⚠️ Long-press tap didn't change app")
+            print(f"⚠️ Tap attempt {attempt + 1} failed: {result.stderr.strip()}")
+            time.sleep(0.5)  # Short delay between retries
             
-        # If all direct tap methods failed, try a shell monkey event
-        print("🔍 Trying diagnostic info...")
-        try:
-            if x < device_width/2:
-                side = "left"
-            else:
-                side = "right"
-                
-            if y < device_height/2:
-                vertical = "top"
-            else:
-                vertical = "bottom"
-                
-            print(f"📊 Tap location: {side}-{vertical} of screen at {x},{y}")
-        except Exception:
-            pass
-            
-        print("❌ All tap methods failed to actually change app state")
+        print("❌ All tap attempts failed")
+        return False
         
-        # Even though no app change was detected, return success if at least one command executed
-        # This gives the agent a chance to retry with a different approach
-        return True
-            
     except Exception as e:
-        print(f"❌ Error during tap: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error executing tap: {e}")
         return False
 
 
@@ -401,6 +384,9 @@ def type_text_with_uiautomator2(adb_path: str, text: str, x: float = None, y: fl
     
     This uses the python-uiautomator2 library if available to directly input text
     into the input field at the specified coordinates or the most recently focused field.
+    Note: prior implementations attempted `u2.connect(adb_server_host=..., adb_server_port=...)`
+    which raised `TypeError: connect() got an unexpected keyword argument 'adb_server_host'`.
+    This version simply calls `u2.connect()` to establish the session.
     
     Args:
         adb_path: Path to ADB executable
@@ -422,20 +408,18 @@ def type_text_with_uiautomator2(adb_path: str, text: str, x: float = None, y: fl
         
         print("🤖 Attempting to use UIAutomator2 for direct text input...")
         
-        # Connect to device using ADB path
-        # Extract ADB host and port if needed
-        adb_server_host = "127.0.0.1"
-        adb_server_port = 5037
+        # Connect to device (previously attempted with adb_server_host/port args and failed: TypeError: connect() got an unexpected keyword argument 'adb_server_host')
+        try:
+            device = u2.connect()
+        except Exception as e:
+            print(f"⚠️ UIAutomator2 connect fallback failed: {e}")
+            return False
         
-        if ":" in adb_path:
-            # If adb_path contains host:port information, extract it
-            parts = adb_path.split(":")
-            if len(parts) >= 3:
-                adb_server_host = parts[-2]
-                adb_server_port = int(parts[-1])
-        
-        # Connect to device
-        device = u2.connect(adb_server_host=adb_server_host, adb_server_port=adb_server_port)
+        # If no text provided, use UIAutomator2 to tap and bring up keyboard
+        if text == "" and x is not None and y is not None:
+            print("👆 UIAutomator2 fallback: tapping input field to bring up keyboard")
+            device.click(x, y)
+            return True
         
         # If coordinates provided, tap first
         if x is not None and y is not None:

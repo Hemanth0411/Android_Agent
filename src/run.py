@@ -9,6 +9,7 @@ import argparse
 import os
 import sys
 import time
+import subprocess
 from typing import Optional
 
 # Add src directory to path for imports
@@ -17,7 +18,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from android_agent.android_agent import AndroidAgent, AndroidAgentOptions, AndroidGoalState
 from android_agent.android_action import AndroidAction, AndroidActionType
 from android_agent.openai_planner import OpenAIPlanner, OpenAIPlannerOptions
-from android_agent.android_controller import is_keyboard_visible, dismiss_keyboard
+from android_agent.android_controller import (
+    is_keyboard_visible, 
+    dismiss_keyboard,
+    get_current_app,
+    press_home,
+    press_back
+)
 
 
 def validate_environment(adb_path: str) -> bool:
@@ -41,7 +48,6 @@ def validate_environment(adb_path: str) -> bool:
         
     # Check device connection
     try:
-        import subprocess
         result = subprocess.run([adb_path, "devices"], capture_output=True, text=True)
         if "device" not in result.stdout and "emulator" not in result.stdout:
             print("Error: No Android device connected")
@@ -84,6 +90,8 @@ def parse_args():
     parser.add_argument("--keyboard_check", action="store_true", 
                       help="Verify keyboard appearance before typing")
     parser.add_argument("--example", help="Name of example task to run (e.g. 'search_google', 'test_input')")
+    parser.add_argument("--skip_chrome_setup", action="store_true",
+                      help="Skip Chrome first-run setup if possible")
     
     return parser.parse_args()
 
@@ -105,7 +113,10 @@ def add_default_instructions(instructions: list) -> list:
         "When typing, make sure to press enter/search after completing input",
         "If stuck in a loop, try using the back button or going to home screen",
         "Be patient when waiting for apps to load or respond to actions",
-        "Verify that actions produce visible changes before proceeding"
+        "Verify that actions produce visible changes before proceeding",
+        "If Chrome shows first-run screen, look for and tap 'Use without an account'",
+        "If first-run screen persists, try tapping different parts of the screen",
+        "After bypassing first-run, wait for Chrome to fully load before proceeding"
     ]
     
     # Add defaults that don't already exist
@@ -133,6 +144,66 @@ def check_keyboard_state(adb_path: str) -> None:
             dismiss_keyboard(adb_path)
     except Exception as e:
         print(f"Error checking keyboard state: {e}")
+
+
+def launch_chrome(adb_path: str, skip_setup: bool = False) -> bool:
+    """Launch Chrome with first-run handling.
+    
+    Args:
+        adb_path: Path to ADB executable
+        skip_setup: Whether to try skipping first-run setup
+        
+    Returns:
+        bool: True if Chrome launched successfully
+    """
+    print("\n🌐 Launching Chrome with first-run handling...")
+    
+    # First try direct launch with flags to skip first-run
+    if skip_setup:
+        try:
+            cmd = f"{adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main --es \"com.android.chrome.firstrun.skip\" \"true\""
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0 and "Error" not in result.stdout:
+                print("✅ Chrome launched with skip-first-run flag")
+                time.sleep(2)  # Wait for Chrome to load
+                return True
+        except Exception as e:
+            print(f"⚠️ Direct launch failed: {e}")
+    
+    # If direct launch fails, try standard launch
+    try:
+        cmd = f"{adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0 and "Error" not in result.stdout:
+            print("✅ Chrome launched with standard command")
+            time.sleep(2)
+            
+            # Check if we're in first-run screen
+            current_app = get_current_app(adb_path)
+            if "firstrun" in current_app.lower():
+                print("⚠️ First-run screen detected - attempting to bypass")
+                # Try tapping "Use without an account" at different positions
+                for y in [0.75, 0.8, 0.85]:
+                    tap_cmd = f"{adb_path} shell input tap 540 {int(2400 * y)}"
+                    subprocess.run(tap_cmd, shell=True)
+                    time.sleep(1)
+                    
+                    # Check if we're out of first-run
+                    current_app = get_current_app(adb_path)
+                    if "firstrun" not in current_app.lower():
+                        print("✅ Successfully bypassed first-run screen")
+                        return True
+                
+                print("⚠️ Could not bypass first-run screen")
+                return False
+            
+            return True
+    except Exception as e:
+        print(f"⚠️ Standard launch failed: {e}")
+    
+    return False
 
 
 def main():
@@ -185,6 +256,11 @@ def main():
         if args.keyboard_check:
             check_keyboard_state(args.adb_path)
         
+        # If goal involves Chrome, try to launch it first
+        if "chrome" in args.goal.lower() or "browser" in args.goal.lower():
+            if not launch_chrome(args.adb_path, args.skip_chrome_setup):
+                print("⚠️ Could not launch Chrome - proceeding with agent anyway")
+        
         # Start agent
         print(f"\n========== Starting Android Agent ==========")
         print(f"Goal: {args.goal}")
@@ -224,7 +300,7 @@ def main():
         try:
             print("\nPerforming cleanup...")
             # Try to go back to home screen
-            agent._take_action(AndroidAction(action=AndroidActionType.PRESS, key=3))
+            press_home(args.adb_path)
             # Check if keyboard is visible and dismiss it
             if is_keyboard_visible(args.adb_path):
                 print("Dismissing keyboard...")

@@ -12,6 +12,7 @@ import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
+import random
 
 from .android_controller import (
     get_device_size,
@@ -151,43 +152,43 @@ class AndroidAgent:
                 if not action.coordinate:
                     print("❌ Error: No coordinate specified for tap action")
                     return False
+                
+                # Get device dimensions
+                device_w, device_h = get_device_size(self.adb_path)
+                
+                # Extract coordinates
                 x, y = action.coordinate.x, action.coordinate.y
                 
-                # Check if this is a tap on an input field and note the coordinates
-                # for possible UIAutomator2 typing fallback
-                if self.state_tracker._is_input_box(action.coordinate):
-                    self.last_input_tap_coords = action.coordinate
-                    print(f"📝 Noted input field tap at {action.coordinate} for potential fallback typing")
+                # Let tap function handle the coordinate scaling
+                tap_result = tap(self.adb_path, x, y, device_w, device_h)
                 
-                tap(self.adb_path, x, y)
+                if tap_result:
+                    # Record input-box tap for subsequent TYPE actions
+                    if self.state_tracker._is_input_box(action.coordinate):
+                        self.last_input_tap_coords = action.coordinate
+                        self.state_tracker.input_box_tapped = True
+                    return True
+                    
+                # If tap failed, try alternative tap location slightly offset
+                print("⚠️ First tap failed, trying offset tap...")
+                offset = 5  # 5 pixel offset
+                tap_result = tap(self.adb_path, x + offset, y + offset, device_w, device_h)
                 
-                # Wait a bit after tapping to allow keyboard to appear
-                time.sleep(0.5)
-                
-                # Update keyboard visibility status
-                try:
-                    keyboard_visible = is_keyboard_visible(self.adb_path)
-                    self.state_tracker.set_keyboard_visible(keyboard_visible)
-                    if keyboard_visible:
-                        print("⌨️ Keyboard appeared after tap")
-                except Exception as e:
-                    print(f"⚠️ Failed to check keyboard state: {e}")
-                
+                if tap_result:
+                    if self.state_tracker._is_input_box(action.coordinate):
+                        self.last_input_tap_coords = action.coordinate
+                        self.state_tracker.input_box_tapped = True
+                    return True
+                    
+                return False
             elif action_type == AndroidActionType.TYPE:
                 if not action.text:
                     print("❌ Error: No text specified for type action")
                     return False
-                
-                # Use smart text input method that includes UIAutomator2 fallback
-                # if keyboard is not visible
-                if hasattr(self, 'last_input_tap_coords') and self.last_input_tap_coords:
-                    x, y = self.last_input_tap_coords.x, self.last_input_tap_coords.y
-                    print(f"📝 Using last input field tap at {self.last_input_tap_coords} for smart typing")
-                    smart_type_text(self.adb_path, action.text, x, y)
-                else:
-                    # No coordinates available, try without them
-                    smart_type_text(self.adb_path, action.text)
-                
+                # Inject text directly via ADB without UIAutomator2
+                type_text(self.adb_path, action.text)
+                print(f"⌨️ Typed text via ADB shell: '{action.text}'")
+                return True
             elif action_type == AndroidActionType.SWIPE_UP:
                 swipe_up(self.adb_path, distance=0.5)
             elif action_type == AndroidActionType.SWIPE_DOWN:
@@ -212,7 +213,10 @@ class AndroidAgent:
                     command = f"{self.adb_path} shell input keyevent {key}"
                     subprocess.run(command, shell=True, check=True)
             elif action_type == AndroidActionType.WAIT:
-                duration = action.duration if action.duration else 2
+                # Use at least 5 seconds for wait actions
+                duration = action.duration if action.duration is not None else 5
+                if duration < 5:
+                    duration = 5
                 print(f"⏱️ Waiting for {duration} seconds...")
                 time.sleep(duration)
             elif action_type == AndroidActionType.LAUNCH_APP:
@@ -320,6 +324,14 @@ class AndroidAgent:
             print(f"📸 Taking screenshot...")
             screenshot_base64 = get_screenshot_base64(self.adb_path, screenshot_path)
             print(f"✅ Screenshot captured: {len(screenshot_base64)//1024}KB in base64")
+            
+            # Clean up the saved screenshot immediately
+            try:
+                if os.path.exists(screenshot_path):
+                    os.remove(screenshot_path)
+                    print(f"✅ Cleaned up screenshot file: {screenshot_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to clean screenshot file: {e}")
             
             # Check if we see Chrome UI elements in the screenshots
             # This is a fallback to help with app detection
@@ -686,19 +698,15 @@ class AndroidAgent:
             self.update_status(AndroidGoalState.FAILED)
             return
         
-        # Special case for opening Chrome - use direct launch if possible
+        # Special case for opening Chrome - only when on the launcher
         if next_action.action == AndroidActionType.TAP:
             is_chrome_target = False
-            
-            # Check if we're trying to tap on what might be the Chrome icon
-            if "chrome" in str(current_state.current_app).lower():
-                is_chrome_target = True
-            elif "launcher" in str(current_state.current_app).lower():
-                # If we're on the launcher and the tap is in the bottom dock area
-                # it's likely we're trying to tap on Chrome
+            # Only treat taps as Chrome-launch when on the launcher dock area
+            if "launcher" in str(current_state.current_app).lower():
+                # If tap is in the bottom dock region, assume Chrome icon
                 if next_action.coordinate and next_action.coordinate.y > 0.8:
                     is_chrome_target = True
-                    
+            
             if is_chrome_target:
                 print("🌐 Detected possible Chrome icon tap - trying Chrome-specific strategies")
                 

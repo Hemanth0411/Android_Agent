@@ -1,7 +1,7 @@
 """Example script to demonstrate searching Google on Android.
 
 This script shows how to:
-1. Launch Chrome browser
+1. Launch Chrome browser with first-run handling
 2. Navigate to Google.com
 3. Perform a search with enhanced keyboard handling
 4. Verify search results
@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 import time
+import subprocess
 from typing import List, Optional
 
 # Add the parent directory to the Python path
@@ -19,24 +20,78 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from android_agent.android_agent import AndroidAgent, AndroidAgentOptions, AndroidGoalState
 from android_agent.android_action import AndroidAction, AndroidActionType
 from android_agent.openai_planner import OpenAIPlanner, OpenAIPlannerOptions
-from android_agent.android_controller import is_keyboard_visible, wait_for_keyboard, dismiss_keyboard
-
+from android_agent.android_controller import (
+    is_keyboard_visible, 
+    wait_for_keyboard, 
+    dismiss_keyboard,
+    get_current_app,
+    press_home,
+    press_back
+)
 
 def get_api_key(api_key: Optional[str] = None) -> Optional[str]:
-    """Get OpenAI API key from args or environment.
-    
-    Args:
-        api_key: API key from command line
-        
-    Returns:
-        API key if found, None otherwise
-    """
+    """Get OpenAI API key from args or environment."""
     return api_key or os.environ.get("OPENAI_API_KEY")
 
+def launch_chrome(adb_path: str) -> bool:
+    """Launch Chrome with first-run handling.
+    
+    Args:
+        adb_path: Path to ADB executable
+        
+    Returns:
+        bool: True if Chrome launched successfully
+    """
+    print("\n🌐 Launching Chrome with first-run handling...")
+    
+    # First try direct launch with flags to skip first-run
+    try:
+        cmd = f"{adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main --es \"com.android.chrome.firstrun.skip\" \"true\""
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0 and "Error" not in result.stdout:
+            print("✅ Chrome launched with skip-first-run flag")
+            time.sleep(2)  # Wait for Chrome to load
+            return True
+    except Exception as e:
+        print(f"⚠️ Direct launch failed: {e}")
+    
+    # If direct launch fails, try standard launch
+    try:
+        cmd = f"{adb_path} shell am start -a android.intent.action.VIEW -d \"about:blank\" -n com.android.chrome/com.google.android.apps.chrome.Main"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0 and "Error" not in result.stdout:
+            print("✅ Chrome launched with standard command")
+            time.sleep(2)
+            
+            # Check if we're in first-run screen
+            current_app = get_current_app(adb_path)
+            if "firstrun" in current_app.lower():
+                print("⚠️ First-run screen detected - attempting to bypass")
+                # Try tapping "Use without an account" at different positions
+                for y in [0.75, 0.8, 0.85]:
+                    tap_cmd = f"{adb_path} shell input tap 540 {int(2400 * y)}"
+                    subprocess.run(tap_cmd, shell=True)
+                    time.sleep(1)
+                    
+                    # Check if we're out of first-run
+                    current_app = get_current_app(adb_path)
+                    if "firstrun" not in current_app.lower():
+                        print("✅ Successfully bypassed first-run screen")
+                        return True
+                
+                print("⚠️ Could not bypass first-run screen")
+                return False
+            
+            return True
+    except Exception as e:
+        print(f"⚠️ Standard launch failed: {e}")
+    
+    return False
 
 def main():
     """Main function to run the Google search automation."""
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description="Automate Google search on Android")
     parser.add_argument("--adb_path", required=True, help="Path to ADB executable")
     parser.add_argument("--api_key", help="OpenAI API key (can also use OPENAI_API_KEY env var)")
@@ -84,6 +139,9 @@ def main():
             "After tapping the search bar, wait for keyboard to appear before typing",
             "If the keyboard doesn't appear after tapping, try tapping a different part of the search bar",
             "After typing, look for and tap the 'Search' or 'Go' button on the keyboard",
+            "If Chrome shows first-run screen, look for and tap 'Use without an account'",
+            "If first-run screen persists, try tapping different parts of the screen",
+            "After bypassing first-run, wait for Chrome to fully load before proceeding"
         ],
         max_steps=30,
         pause_after_each_action=args.pause,
@@ -97,10 +155,10 @@ def main():
         goal=f"""Search for '{args.search_term}' on Google by:
         1. Going to the home screen
         2. Finding and opening the Chrome browser app (look for the Chrome icon specifically)
-        3. If Chrome doesn't open correctly:
-           - Press back to exit any other Google apps
-           - Try opening Chrome again
-           - If still not working, press home and try again
+        3. If Chrome shows first-run screen:
+           - Look for and tap 'Use without an account'
+           - If that doesn't work, try tapping different parts of the screen
+           - Wait for Chrome to fully load after bypassing first-run
         4. Once in Chrome:
            - Look for the address bar
            - Tap it to focus
@@ -142,6 +200,10 @@ def main():
             print("Debug mode enabled")
         print("\nPress Ctrl+C to abort\n")
         
+        # Try to launch Chrome first
+        if not launch_chrome(args.adb_path):
+            print("⚠️ Could not launch Chrome - proceeding with agent anyway")
+        
         agent.start()
         
         # Check final status
@@ -171,7 +233,7 @@ def main():
         try:
             print("\nPerforming cleanup...")
             # Try to go back to home screen
-            agent._take_action(AndroidAction(action=AndroidActionType.PRESS, key=3))
+            press_home(args.adb_path)
             # Check if keyboard is visible and dismiss it
             if is_keyboard_visible(args.adb_path):
                 print("Dismissing keyboard...")

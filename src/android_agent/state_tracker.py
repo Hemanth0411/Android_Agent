@@ -198,11 +198,30 @@ class AndroidStateTracker:
         # 3. Bottom text input areas (common in chat apps)
         if 0.75 <= y <= 0.95:
             if 0.05 <= x <= 0.8:  # Left side of bottom (typical text input)
-                print("📝 Possible chat/message input field detected")
+                print("📝 Likely bottom text input area detected")
                 return True
         
         # Default to not an input box
         return False
+
+    def _get_input_box_bounds(self, coordinate: Union[Tuple[float, float], 'Coordinate']) -> Tuple[float, float, float, float]:
+        """Get bounding box around tapped input coordinate for retry taps."""
+        # Extract numeric values
+        if hasattr(coordinate, 'x') and hasattr(coordinate, 'y'):
+            x, y = coordinate.x, coordinate.y
+        else:
+            x, y = coordinate[0], coordinate[1]
+        # Determine region size: assume pixel coords if greater than 1, else normalized
+        if isinstance(x, (int, float)) and x > 1:
+            dx, dy = 50, 20  # pixel offsets
+        else:
+            dx, dy = 0.1, 0.05  # normalized offsets
+        # Compute bounds
+        left = max(0, x - dx)
+        top = max(0, y - dy)
+        right = x + dx
+        bottom = y + dy
+        return left, top, right, bottom
         
     def set_keyboard_visible(self, visible: bool) -> None:
         """Set keyboard visibility flag.
